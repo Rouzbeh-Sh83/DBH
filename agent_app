@@ -1,0 +1,108 @@
+"""
+agent_app.py – «DBH Data Agent» (Streamlit). Kjør:  python -m streamlit run agent_app.py
+
+Skjermen følger skissen: datakilde, tabell, år, output (CSV/Parquet) og knappen HENT DATA.
+Under kommer forhåndsvisning, profil, enkle analyser og (valgfritt) spørsmål til GPT-5.
+"""
+from __future__ import annotations
+
+import json
+import os
+from pathlib import Path
+
+import pandas as pd
+import streamlit as st
+
+import dbh_client as C
+
+st.set_page_config(page_title="DBH Data Agent", page_icon="🤖", layout="wide")
+st.title("DBH Data Agent")
+st.caption("Kilde: DBH, Direktoratet for høyere utdanning og kompetanse (HK-dir).")
+
+# ------------------------------------------------------------ skjema (som i skissen)
+with st.form("hent"):
+    c1, c2, c3, c4 = st.columns([1, 1, 1.4, 1.4])
+    source = c1.selectbox("Datakilde", ["DBH API"])
+    table_id = c2.number_input("Tabell", min_value=1, max_value=999, value=707, step=1,
+                               help="Slå opp tabellnummer i tabell 001 (innhold) i DBH API-klienten.")
+    this_year = pd.Timestamp.today().year
+    years = c3.multiselect("År", list(range(this_year, 2009, -1)), default=[2020])
+    formats = c4.multiselect("Output", ["csv", "parquet"], default=["csv", "parquet"])
+    with st.expander("Avansert: egen JSON-spørring (bygget i DBH API-klienten)"):
+        custom = st.text_area("La stå tom for standardspørring", height=140)
+        year_field = st.text_input("Navn på årsfelt", "Årstall")
+        group_by = st.text_input("groupBy (kommaseparert, kreves for tabeller med Math=1)", "")
+    out_dir = st.text_input("Lagre i mappe", str(Path.home() / "dbh_data"))
+    stream = st.checkbox("Stor tabell (bruk streamCsvData)")
+    go = st.form_submit_button("HENT DATA", type="primary")
+
+if go:
+    try:
+        if custom.strip():
+            query = json.loads(custom)
+        else:
+            gb = [g.strip() for g in group_by.split(",") if g.strip()] or None
+            query = C.build_query(int(table_id), years or None, group_by=gb, year_field=year_field)
+        with st.spinner("Henter fra DBH …"):
+            df = C.fetch_table(query, stream=stream)
+        st.session_state.update(df=df, table_id=int(table_id), query=query)
+        paths = C.save_outputs(df, int(table_id), years, out_dir, formats) if formats else {}
+        st.success(f"Hentet {len(df):,} rader og {df.shape[1]} kolonner.".replace(",", " "))
+        for k, p in paths.items():
+            st.write(f"Lagret {k.upper()}: `{p}`")
+    except Exception as e:                      # vis feilen i stedet for å krasje
+        st.error(str(e))
+
+df = st.session_state.get("df")
+if df is None:
+    st.info("Velg tabell og år, og trykk **HENT DATA**.")
+    st.stop()
+
+tab_data, tab_an, tab_ai, tab_pbi = st.tabs(["Data", "Analyse", "Spør KI", "Power BI"])
+
+with tab_data:
+    st.dataframe(df.head(500), use_container_width=True)
+    with st.expander("Spørringen som ble sendt"):
+        st.json(st.session_state["query"])
+    st.write(C.profile(df)["kolonner"])
+
+with tab_an:
+    typed = C.to_numeric_cols(df)
+    nums = list(typed.select_dtypes("number").columns)
+    cats = [c for c in typed.columns if c not in nums]
+    if not nums:
+        st.warning("Fant ingen tallkolonner.")
+    else:
+        a, b, n = st.columns(3)
+        by = a.selectbox("Grupper på", list(typed.columns))
+        val = b.selectbox("Sum av", nums)
+        k = n.slider("Vis topp", 5, 50, 15)
+        res = C.top_n(df, by, val, k)
+        st.bar_chart(res.set_index(by)[val])
+        st.dataframe(res, use_container_width=True)
+
+with tab_ai:
+    st.caption("GPT-5 får bare kalle faste verktøy (summer, topp N, sammenlign år). "
+               "Den ser en profil av tabellen, ikke alle rader.")
+    if not os.getenv("OPENAI_API_KEY"):
+        st.warning("Sett miljøvariabelen OPENAI_API_KEY for å bruke KI-fanen.")
+    q = st.text_input("Spørsmål", "Hvilke kategorier er størst, og hva bør jeg være obs på i tallene?")
+    if st.button("Spør") and os.getenv("OPENAI_API_KEY"):
+        try:
+            import llm_agent
+            with st.spinner("Analyserer …"):
+                answer, log = llm_agent.ask(df, q, st.session_state["table_id"])
+            st.markdown(answer)
+            with st.expander("Hva KI-en gjorde (verktøykall)"):
+                st.json(log)
+        except Exception as e:
+            st.error(f"KI-kallet feilet: {e}")
+
+with tab_pbi:
+    st.markdown(
+        "**Slik kobler du til Power BI**\n"
+        "1. Power BI Desktop → *Hent data* → *Parquet* (eller *Mappe* / *Tekst/CSV*).\n"
+        f"2. Pek på mappen `{out_dir}`.\n"
+        "3. Ved planlagt oppdatering i Power BI-tjenesten trengs en datagateway hvis mappen ligger på din PC.\n"
+        "4. La agenten (eller en planlagt oppgave) skrive nye filer til samme mappe, så oppdateres rapporten."
+    )
