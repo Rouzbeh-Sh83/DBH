@@ -10,3 +10,21 @@ pandas>=2.0
 pyarrow>=15
 requests>=2.31
 openai>=1.40
+Filen  åpner og kjører i Spyder er agent_app.py.  
+
+De andre filene:
+
+dbh_client.py og llm_agent.py er hjelpefiler. agent_app.py henter dem inn med import. Det trenger ikke åpne dem, men de må ligge i samme mappe.
+requirements.txt  viser hvilke pakker som må installeres. Kjør dette én gang i Spyder-konsollen (eller i Anaconda Prompt):
+ Viktig : pip install -r requirements.txt
+__pycache__ lager Python selv. 
+
+Slik gjør vi det i Spyder:
+
+Åpne agent_app.py (File → Open).
+Sett arbeidsmappen til Agent_Mappe. Spyder gjør vanligvis dette automatisk når du kjører en fil derfra. Hvis ikke, bruker du mappeikonet øverst til høyre.
+Trykk F5 for å kjøre.
+
+ Står det import streamlit øverst i agent_app.py? Da fungerer det ikke å trykke F5. Du må i stedet skrive dette i Anaconda Prompt, inne i mappen:
+
+streamlit run agent_app.py
