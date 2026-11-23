@@ -1,0 +1,224 @@
+"""
+dbh_client.py – "verktøylaget" til DBH Data Agent. Ingen Streamlit og ingen KI her:
+bare henting, lagring og enkle, trygge analysefunksjoner som både UI og KI-agent kan kalle.
+
+Basert på HK-dirs API-dokumentasjon (dbh.hkdir.no/static/files/dokumenter/api/api_dokumentasjon.pdf).
+Kilde skal alltid oppgis: DBH, Direktoratet for høyere utdanning og kompetanse (HK-dir).
+"""
+from __future__ import annotations
+
+import io
+import json
+import os
+import time
+from datetime import datetime
+from pathlib import Path
+
+import pandas as pd
+
+# DBH-dokumentasjonen nevner to adresser. De prøves i rekkefølge. Sett DBH_API_BASE for å prøve en egen først.
+API_BASES = [b for b in (os.getenv("DBH_API_BASE"),
+                         "https://dbh.hkdir.no/api",
+                         "https://dbh-data.dataporten-api.no/Tabeller") if b]
+API_BASE = API_BASES[0]
+CSV_SMALL, CSV_STREAM = "hentCSVTabellData", "streamCsvData"
+LAST_URL = ""            # adressen som sist ga data (vises i appen hvis du vil)
+
+
+# ---------------------------------------------------------------- spørring
+def build_query(table_id: int, years: list[int] | None = None, *, group_by: list[str] | None = None,
+                variables: list[str] | None = None, year_field: str = "Årstall",
+                extra_filters: list[dict] | None = None) -> dict:
+    """Bygger en DBH-spørring.
+
+    - Matematiske tabeller (Math=1 i tabell 001) MÅ ha group_by.
+    - Listetabeller bruker variables (standard ["*"]).
+    - Minst ett filter per tabell er påkrevd; år settes som 'item'-filter.
+    Sjekk alltid i DBH API-klienten at feltnavnene finnes i akkurat din tabell.
+    """
+    q: dict = {"tabell_id": int(table_id), "api_versjon": 1, "statuslinje": "N", "kodetekst": "J"}
+    if group_by:
+        q["groupBy"] = group_by
+        q["sortBy"] = group_by[:1]
+    else:
+        q["variabler"] = variables or ["*"]
+        q["sortBy"] = []
+    filters = []
+    if years:
+        filters.append({"variabel": year_field, "selection": {"filter": "item", "values": [str(y) for y in years]}})
+    else:
+        filters.append({"variabel": year_field, "selection": {"filter": "all", "values": ["*"]}})
+    q["filter"] = filters + (extra_filters or [])
+    return q
+
+
+# ---------------------------------------------------------------- henting
+class DBHError(RuntimeError):
+    pass
+
+
+def _post(http, url: str, query: dict, headers: dict, retries: int):
+    """Ett kall med nye forsøk ved nettverksfeil og 5xx. Returnerer (status, tekst, bytes); status None = nettverksfeil."""
+    last = None
+    for attempt in range(1, retries + 1):
+        try:
+            r = http.post(url, json=query, headers=headers, timeout=(15, 300))
+            if r.status_code >= 500 and attempt < retries:
+                last = f"{r.status_code}"
+                time.sleep(2 * attempt)
+                continue
+            return r.status_code, r.text, r.content
+        except Exception as e:                            # nettverk, timeout
+            last = str(e)
+            if attempt < retries:
+                time.sleep(2 * attempt)
+    return None, f"nettverksfeil: {last}", b""
+
+
+def _parse_csv(content: bytes) -> pd.DataFrame:
+    text = content.decode("utf-8-sig", errors="replace")
+    if not text.strip():
+        raise DBHError("Tomt svar fra API-et (ingen rader for dette utvalget?).")
+    if text.lstrip()[:1] in "{[<":
+        raise DBHError(f"Svaret er ikke CSV: {text[:150]!r}")
+    first = text.splitlines()[0]
+    sep = ";" if first.count(";") >= first.count(",") else ","
+    df = pd.read_csv(io.StringIO(text), sep=sep, dtype=str, keep_default_na=False)
+    df.columns = [c.strip() for c in df.columns]
+    return df
+
+
+def fetch_table(query: dict, *, stream: bool = False, retries: int = 3, session=None) -> pd.DataFrame:
+    """Henter data som DataFrame.
+
+    Prøver begge DBH-adressene og begge endepunktene (CSV og stream). Hvis du har satt DBH_JWT og serveren
+    avviser tokenet (401/403), prøves det også uten token, siden åpne data ikke krever innlogging.
+    Feil i selve spørringen (400/422) stoppes med en gang. Ellers vises alle forsøkene i feilmeldingen.
+    """
+    global LAST_URL
+    import requests
+
+    http = session or requests
+    endpoints = [CSV_STREAM, CSV_SMALL] if stream else [CSV_SMALL, CSV_STREAM]
+    token = os.getenv("DBH_JWT")
+    attempts: list[str] = []
+    statuses: list[int | None] = []
+
+    for base in API_BASES:
+        for ep in endpoints:
+            url = f"{base.rstrip('/')}/{ep}"
+            for use_token in ([True, False] if token else [False]):
+                headers = {"Content-Type": "application/json"}
+                if use_token:
+                    headers["Authorization"] = f"Bearer {token}"
+                status, text, content = _post(http, url, query, headers, retries)
+                label = f"{url} ({'med' if use_token else 'uten'} token)"
+                statuses.append(status)
+                if status == 200:
+                    try:
+                        df = _parse_csv(content)
+                    except DBHError as e:
+                        attempts.append(f"{label} -> 200 men {e}")
+                        continue
+                    LAST_URL = url
+                    return df
+                if status in (400, 422):                  # feil i spørringen: andre adresser hjelper ikke
+                    raise DBHError(f"API svarte {status} på {url}. Sjekk tabellnummer, feltnavn og filter. "
+                                   f"Svar fra serveren: {text[:300]}")
+                attempts.append(f"{label} -> {status if status else text[:100]}"
+                                + (f": {text[:120]}" if status and text else ""))
+                if status is None:                        # ingen kontakt: ikke prøv flere endepunkter på denne adressen
+                    break
+            else:
+                continue
+            break
+
+    hint = ""
+    if statuses and all(s in (401, 403) for s in statuses if s is not None) and any(s is not None for s in statuses):
+        hint = ("\n\nAlle adresser ba om innlogging. Tabellen er kanskje ikke åpen, eller DBH krever token. "
+                "Prøv en annen tabell, test samme spørring i DBH API-klienten, eller kontakt dbh@hkdir.no.")
+    raise DBHError("Klarte ikke hente data. Forsøk:\n- " + "\n- ".join(attempts) + hint)
+
+
+def to_numeric_cols(df: pd.DataFrame) -> pd.DataFrame:
+    """API-et leverer alt som tekst. Gjør kolonner som ser ut som tall om til tall (komma eller punktum)."""
+    out = df.copy()
+    for c in out.columns:
+        s = out[c].astype(str).str.replace(" ", "", regex=False).str.replace(" ", "", regex=False)
+        s = s.str.replace(",", ".", regex=False)
+        n = pd.to_numeric(s, errors="coerce")
+        nonempty = out[c].astype(str).str.strip() != ""
+        if nonempty.any() and n[nonempty].notna().mean() > 0.95 and "kode" not in c.lower():
+            out[c] = n
+    return out
+
+
+# ---------------------------------------------------------------- lagring
+def save_outputs(df: pd.DataFrame, table_id: int, years: list[int], folder: str | Path,
+                 formats: list[str]) -> dict[str, Path]:
+    """Lagrer CSV og/eller Parquet + en metadatafil. Returnerer stier.
+
+    Parquet krever pyarrow (pip install pyarrow). Power BI leser begge, men Parquet er mindre og beholder datatyper.
+    """
+    folder = Path(folder)
+    folder.mkdir(parents=True, exist_ok=True)
+    ytxt = f"{min(years)}-{max(years)}" if years else "alle"
+    base = f"dbh_tabell{table_id}_{ytxt}"
+    paths: dict[str, Path] = {}
+    typed = to_numeric_cols(df)
+    if "csv" in formats:
+        p = folder / f"{base}.csv"
+        typed.to_csv(p, sep=";", decimal=",", index=False, encoding="utf-8-sig")   # åpner riktig i norsk Excel
+        paths["csv"] = p
+    if "parquet" in formats:
+        try:
+            p = folder / f"{base}.parquet"
+            typed.to_parquet(p, index=False)
+            paths["parquet"] = p
+        except ImportError as e:
+            raise DBHError("Parquet krever pyarrow. Kjør: pip install pyarrow") from e
+    meta = {
+        "kilde": "DBH, Direktoratet for høyere utdanning og kompetanse (HK-dir)",
+        "tabell_id": table_id, "år": years, "rader": len(df), "kolonner": list(df.columns),
+        "hentet": datetime.now().isoformat(timespec="seconds"),
+    }
+    (folder / f"{base}.meta.json").write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
+    return paths
+
+
+# ---------------------------------------------------------------- trygge analyseverktøy
+def profile(df: pd.DataFrame) -> dict:
+    """Kompakt beskrivelse av tabellen. Dette (ikke selve dataene) er det KI-en trenger å se."""
+    t = to_numeric_cols(df)
+    num = t.select_dtypes("number")
+    return {
+        "rader": len(t),
+        "kolonner": {c: str(t[c].dtype) for c in t.columns},
+        "tomme_celler": {c: int((df[c].astype(str).str.strip() == "").sum()) for c in df.columns if (df[c].astype(str).str.strip() == "").any()},
+        "numerisk_sammendrag": num.describe().round(2).to_dict() if not num.empty else {},
+        "eksempelrader": df.head(5).to_dict("records"),
+    }
+
+
+def group_sum(df: pd.DataFrame, by: list[str], value: str) -> pd.DataFrame:
+    t = to_numeric_cols(df)
+    for c in [*by, value]:
+        if c not in t.columns:
+            raise DBHError(f"Ukjent kolonne: {c}. Tilgjengelig: {list(t.columns)}")
+    return t.groupby(by, dropna=False)[value].sum().reset_index().sort_values(value, ascending=False)
+
+
+def top_n(df: pd.DataFrame, by: str, value: str, n: int = 10) -> pd.DataFrame:
+    return group_sum(df, [by], value).head(n)
+
+
+def compare_years(df: pd.DataFrame, year_col: str, key: str, value: str, y1: int, y2: int) -> pd.DataFrame:
+    g = group_sum(df, [key, year_col], value)
+    g[year_col] = pd.to_numeric(g[year_col], errors="coerce")
+    p = g.pivot_table(index=key, columns=year_col, values=value, aggfunc="sum").fillna(0.0)
+    if y1 not in p.columns or y2 not in p.columns:
+        raise DBHError(f"Årene {y1} og {y2} må finnes i dataene. Finnes: {sorted(p.columns)}")
+    out = p[[y1, y2]].copy()
+    out["Endring"] = out[y2] - out[y1]
+    out["Endring %"] = (out["Endring"] / out[y1].where(out[y1] > 0) * 100).round(1)
+    return out.sort_values("Endring", key=abs, ascending=False).reset_index()
