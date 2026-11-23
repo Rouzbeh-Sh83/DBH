@@ -1,0 +1,88 @@
+"""
+llm_agent.py – KI-laget. GPT-5 (eller en annen OpenAI-kompatibel modell) får BARE kalle faste, trygge
+verktøy fra dbh_client.py. Modellen skriver ikke og kjører ikke egen kode, og regner ikke selv:
+tallene kommer fra pandas, forklaringen fra modellen.
+
+Oppsett:  pip install openai
+          set OPENAI_API_KEY=...        (Windows)   |   set DBH_LLM_MODEL=gpt-5   (valgfritt, standard gpt-5)
+Hvis dere bruker Azure OpenAI eller Copilot Studio i stedet, bytt klienten i `_client()`; resten er likt.
+"""
+from __future__ import annotations
+
+import json
+import os
+
+import pandas as pd
+
+import dbh_client as C
+
+AI_LABEL = "⚠️ KI-generert analyse. Kontroller tallene mot DBH-rapporter før bruk. Kilde: DBH, HK-dir."
+
+TOOLS = [
+    {"type": "function", "function": {
+        "name": "group_sum", "description": "Summer en tallkolonne gruppert på én eller flere kolonner.",
+        "parameters": {"type": "object", "properties": {
+            "by": {"type": "array", "items": {"type": "string"}}, "value": {"type": "string"}},
+            "required": ["by", "value"]}}},
+    {"type": "function", "function": {
+        "name": "top_n", "description": "De n største gruppene etter summen av en tallkolonne.",
+        "parameters": {"type": "object", "properties": {
+            "by": {"type": "string"}, "value": {"type": "string"}, "n": {"type": "integer"}},
+            "required": ["by", "value"]}}},
+    {"type": "function", "function": {
+        "name": "compare_years", "description": "Sammenlign to år: endring og prosent per gruppe.",
+        "parameters": {"type": "object", "properties": {
+            "year_col": {"type": "string"}, "key": {"type": "string"}, "value": {"type": "string"},
+            "y1": {"type": "integer"}, "y2": {"type": "integer"}},
+            "required": ["year_col", "key", "value", "y1", "y2"]}}},
+]
+
+SYSTEM = (
+    "Du er en forsiktig dataanalytiker for norsk statistikk om høyere utdanning (DBH, HK-dir). "
+    "Bruk KUN verktøyene til å få tall; aldri regn ut eller gjett tall selv. "
+    "Svar på norsk, kort og konkret. Si fra om data kan være ufullstendig (siste år), skjermet (tall under 3) "
+    "eller om samme program kan stå på flere rader. Hvis spørsmålet ikke kan besvares med tabellen, si det."
+)
+
+
+def _client():
+    from openai import OpenAI
+    return OpenAI()          # leser OPENAI_API_KEY
+
+
+def _run_tool(df: pd.DataFrame, name: str, args: dict) -> str:
+    try:
+        if name == "group_sum":
+            res = C.group_sum(df, args["by"], args["value"]).head(40)
+        elif name == "top_n":
+            res = C.top_n(df, args["by"], args["value"], int(args.get("n", 10)))
+        elif name == "compare_years":
+            res = C.compare_years(df, args["year_col"], args["key"], args["value"], int(args["y1"]), int(args["y2"])).head(40)
+        else:
+            return json.dumps({"feil": f"ukjent verktøy {name}"})
+        return res.to_json(orient="records", force_ascii=False)
+    except Exception as e:                  # feil sendes tilbake til modellen så den kan rette seg
+        return json.dumps({"feil": str(e)}, ensure_ascii=False)
+
+
+def ask(df: pd.DataFrame, question: str, table_id: int, max_steps: int = 6) -> tuple[str, list[dict]]:
+    """Returnerer (svar, logg over verktøykall). Loggen viser nøyaktig hva KI-en gjorde."""
+    client, model = _client(), os.getenv("DBH_LLM_MODEL", "gpt-5")
+    msgs = [
+        {"role": "system", "content": SYSTEM},
+        {"role": "user", "content": f"Tabell {table_id}. Profil av dataene:\n"
+                                    f"{json.dumps(C.profile(df), ensure_ascii=False, default=str)}\n\nSpørsmål: {question}"},
+    ]
+    log: list[dict] = []
+    for _ in range(max_steps):
+        r = client.chat.completions.create(model=model, messages=msgs, tools=TOOLS)
+        m = r.choices[0].message
+        if not m.tool_calls:
+            return f"{m.content}\n\n{AI_LABEL}", log
+        msgs.append(m)
+        for tc in m.tool_calls:
+            args = json.loads(tc.function.arguments or "{}")
+            out = _run_tool(df, tc.function.name, args)
+            log.append({"verktøy": tc.function.name, "argumenter": args, "resultat_forkortet": out[:300]})
+            msgs.append({"role": "tool", "tool_call_id": tc.id, "content": out})
+    return f"Nådde maks antall steg uten endelig svar.\n\n{AI_LABEL}", log
